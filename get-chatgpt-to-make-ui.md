@@ -208,7 +208,7 @@ function getInstanceIds() {
 
 ```json
 {
-  "name": "Abdullah's AirPods Pro",
+  "name": "My AirPods Pro",
   "address": "0000340e224a88bb",
   "instanceId": "BTHENUM\\{0000110B-0000-1000-8000-00805F9B34FB}_VID&0001004C_PID&2027\\9&3A3A251&0&340E224A88BB_C00000000",
   "supports": ["SBC", "AAC"],
