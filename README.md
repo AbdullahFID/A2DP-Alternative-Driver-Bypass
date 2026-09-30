@@ -1,16 +1,43 @@
 # Alternative A2DP Driver - Reverse Engineering Findings
 
-**Date:** 2026-05-06  
+**Original Date:** 2026-05-06 (targeted v1.8.0.1 / v1.8.2.1)  
+**Last Verified:** 2026-09-30 (targeted **v1.8.3.1** — bypass still works, minor delta captured below)
 
-**Updated**: September 9th 2026 (yes 100% working nothing changed from the update)
-
-**Target:** Alternative A2DP Driver v1.8.0.1 (Kernel Driver) / v1.8.2.1 (GUI/Service)  
+**Target (current):** Alternative A2DP Driver **v1.8.3.1** (kernel driver, GUI, and service all bumped)  
 **Vendor:** Luculent Systems, LLC  
 **Install Path:** `C:\Program Files\Luculent Systems\AltA2DP\`
 
-**The key insight: The driver blindly reads codec config from HKLM:\SYSTEM\CurrentControlSet\Services\AltA2DP\Parameters\Devices\Next\{bt_address} and uses it. Write the right registry DWORDs → cycle the BT device → driver reconnects with your chosen codec. That's all the official GUI does.**
+**The key insight: The driver blindly reads codec config from `HKLM:\SYSTEM\CurrentControlSet\Services\AltA2DP\Parameters\Devices\Next\{bt_address}` and uses it. Write the right registry DWORDs → cycle the BT device → driver reconnects with your chosen codec. That's all the official GUI does.**
 
-Your license key pays for the gui but anyone can make the gui, its impossible to FORGE a license key but you dont need one just make your own wrapper ui
+Your license key pays for the GUI but anyone can make the GUI. It is impossible to forge a license key, but you don't need one — just make your own wrapper UI.
+
+---
+
+## Update: 2026-09-30 — v1.8.3.1 delta
+
+Re-verified end-to-end against the current build. **The bypass still works unchanged.** Concrete deltas since the original writeup:
+
+| | 1.8.0.1 / 1.8.2.1 (original) | 1.8.3.1 (current) |
+|---|---|---|
+| Kernel driver `AltA2DP.sys` | 817,632 B, built 2025-10-20 | 823,304 B, built 2026-05-15 |
+| DriverStore INF hash dir | `alta2dp.inf_amd64_98ed8b0dde0ca5c7` | `alta2dp.inf_amd64_f81fce6c1599eba4` |
+| Suite version (Config/SVC/Installer) | 1.8.2.1 | 1.8.3.1 |
+| WHQL cert (kernel) thumbprint | `80340186207957ED96BDFDAD23F87AE9358C0D2B` (expires 2026-07-14) | `6022340C9F4CB00307DF8DB036D392ADAC766212` (expires 2027-05-11) |
+| Kernel driver SHA-256 (current) | — | `D0EEDBF2F3EF658A4B20399BC21C0A6E25048C46F0AC4F329E6ACFFEE60844A4` |
+| Kernel driver PDB | `AltA2DP-1.8.0-f\DRV\Build\...\AltA2DP.pdb` | `AltA2DP-1.8.3-d\DRV\Build\...\AltA2DP.pdb` |
+| New imports in kernel driver | — | `+ strcpy_s`, `+ PsTerminateSystemThread` (hygiene only — bounded string copy, clean thread teardown) |
+| New registry fields (see §4 for details) | — | `VolumeLevel`, `VolumeInitializeDelay`, `DisableAbsoluteVolume`, `AacBitrateMode`, `AacBandwidth`, `AacAfterBurner`, `AacMaxSize`, plus `*Mask` mirror fields under `Current\` |
+
+**Nothing structural changed:**
+- The three-subkey schema (`Capability\` / `Current\` / `Next\` under `Parameters\Devices\`) is identical.
+- The kernel driver still does zero license validation (no `bcrypt` / `crypt32` / `ncrypt` / `winhttp` imports anywhere in the driver — verified by IAT scan).
+- `SharedState\` still contains only the WPP ETW trace GUID — no anti-tamper token.
+- `AltA2dpSVC.exe` still only imports `KERNEL32`, `ADVAPI32`, `CFGMGR32`, and CRT — no crypto, no network. It is purely a PnP + registry-watch glue.
+- The kernel driver has no `\Device\` or `\DosDevices\` endpoint and no `IoCreateDevice` (verified by strings + IAT). It is exposed only through `IoRegisterDeviceInterface` mediated by `portcls.sys`, so it is not usable as a BYOVD vehicle.
+- HVCI / VBS with `CodeIntegrityPolicyEnforcementStatus=2` on my machine loads the driver fine (0 CodeIntegrity denial events), and it is not currently on the Microsoft Vulnerable Driver Blocklist.
+
+**One correction to the previous writeup:** the license signature algorithm is almost certainly **ECDSA (WinRT-provided, most likely P-256)**, not Ed25519 — see §6 for the evidence.
+
 ---
 
 ## Table of Contents
@@ -33,7 +60,7 @@ Your license key pays for the gui but anyone can make the gui, its impossible to
 ┌──────────────────────────────────────────────────────────┐
 │  AltA2dpConfig.exe  (WinUI 3 XAML GUI)                   │
 │  - Per-device codec configuration                        │
-│  - License verification (Ed25519)                        │
+│  - License verification (ECDSA via WinRT crypto)         │
 │  - Writes codec params to Registry\Next\                 │
 │  - Launches AltA2dpDriverInstaller.exe for driver swap   │
 └────────────────────────┬─────────────────────────────────┘
@@ -66,24 +93,29 @@ Your license key pays for the gui but anyone can make the gui, its impossible to
 
 ## 2. Component Breakdown
 
-### Files
+### Files (v1.8.3.1)
 
 | File | Size | Type | Purpose |
 |------|------|------|---------|
-| `AltA2DP.sys` | 818 KB | Kernel driver (KMDF + PortCls) | Audio encoding + BT transport |
+| `AltA2DP.sys` | 823 KB | Kernel driver (KMDF + PortCls) | Audio encoding + BT transport |
 | `AltA2dpSVC.exe` | 75 KB | Win32 service | PnP lifecycle + config bridge |
-| `AltA2dpConfig.exe` | 3 MB | WinUI 3 XAML app | GUI + licensing |
+| `AltA2dpConfig.exe` | 3.19 MB | WinUI 3 / C++ WinRT XAML app | GUI + licensing |
 | `AltA2dpDriverInstaller.exe` | 130 KB | CLI tool | Driver install/uninstall |
 | `AltA2DP.inf` | 14 KB | Driver INF (UTF-16LE) | PnP registration |
 | `AltA2DP.cat` | 12 KB | Catalog file | WHQL signature |
 
-### PE Details (AltA2DP.sys)
+Sizes/dates for v1.8.0.1 differ slightly (see §"Update: 2026-09-30" table above).
+
+### PE Details (AltA2DP.sys v1.8.3.1)
 
 - **Machine:** x86_64 (AMD64)
 - **Subsystem:** NATIVE (kernel mode)
 - **Framework:** KMDF (WDF 1.27) + PortCls audio miniport
-- **PDB Path:** `C:\Products\AltA2DP\AltA2DP-1.8.0-f\DRV\Build\x64\Release\AltA2DP.pdb`
-- **Sections:** `.text` (604KB), `.rdata` (155KB), `.data` (7KB), `PAGE` (14KB), `INIT` (3KB)
+- **PDB Path:** `C:\Products\AltA2DP\AltA2DP-1.8.3-d\DRV\Build\x64\Release\AltA2DP.pdb`
+- **Sections:** `.text` (595 KB), `.rdata` (157 KB), `.data` (8 KB), `.pdata` (12 KB), `PAGE` (14 KB), `INIT` (3 KB)
+- **DllCharacteristics:** `0x4160` — `HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | GUARD_CF`
+- **TimeDateStamp:** `0x6a342c85` (2026-05-15 20:16:05 UTC)
+- **Signer:** CN=Microsoft Windows Hardware Compatibility Publisher (WHQL); cert valid 2026-05-13 → 2027-05-11; timestamp-locked via Microsoft TSA on 2025-08-14 (so signature survives cert expiry).
 
 ---
 
@@ -234,16 +266,36 @@ Parameters\
     │   └── {bt_address}\
     │       ├── (all same codec fields as Capability)
     │       ├── *Mask fields           ← Bitmask versions of each negotiated param
+    │       │                            (SbcChannelModeMask, SbcSamplingFrequencyMask, AacChannelModeMask,
+    │       │                             AacSamplingFrequencyMask, LdacChannelModeMask, LdacSamplingFrequencyMask,
+    │       │                             LdacSampleFormatMask, AptxChannelModeMask, AptxSamplingFrequencyMask,
+    │       │                             AptxHdChannelModeMask, AptxHdSamplingFrequencyMask, AptxHdSampleFormatMask,
+    │       │                             AptxLlChannelModeMask, AptxLlSamplingFrequencyMask)
     │       ├── Opened          (DWORD) ← 1 = connected, 0 = disconnected
     │       ├── Bitrate         (DWORD) ← actual bitrate in bps
     │       ├── ScoActive       (DWORD) ← 1 = HFP call active, A2DP suspended
     │       ├── Delay           (DWORD) ← transport delay in 100ns units
-    │       └── Error           (DWORD) ← error code (0 = none)
+    │       ├── Error           (DWORD) ← error code (0 = none)
+    │       ├── TxTimeStats     (DWORD) ← [1.8.3.1] transmit-timing stats accumulator
+    │       └── TxTimeMax       (DWORD) ← [1.8.3.1] worst-case transmit interval
     └── Next\               ← What to use on next connection (WRITABLE - this is what the GUI writes)
         └── {bt_address}\
             ├── (all same codec fields as Capability)
-            └── VolumeLevel     (DWORD) ← volume (signed 32-bit, negative = attenuation)
+            ├── VolumeLevel            (DWORD) ← volume (signed 32-bit fixed-point, negative = attenuation)
+            ├── VolumeInitializeDelay  (DWORD) ← [1.8.3.1] ms to wait before pushing volume on connect
+            ├── DisableAbsoluteVolume  (DWORD) ← [1.8.3.1] 1 = suppress AVRCP absolute-volume control
+            ├── AacBitrateMode         (DWORD) ← [1.8.3.1] FDK-AAC bitrate mode selector (CBR/VBR)
+            ├── AacBandwidth           (DWORD) ← [1.8.3.1] AAC encoder bandwidth override
+            ├── AacAfterBurner         (DWORD) ← [1.8.3.1] FDK-AAC "afterburner" quality flag (0/1)
+            └── AacMaxSize             (DWORD) ← [1.8.3.1] AAC frame size cap
 ```
+
+> **v1.8.3.1 note:** The kernel driver reads all of the new `[1.8.3.1]` fields above (confirmed via string
+> scan of `AltA2DP.sys` — literal names appear in `.rdata`). They aren't written by default; they're
+> optional overrides. Setting them under `Next\{addr}\` will make the driver honour them on the next
+> A2DP open. The `Current\...\*Mask` fields are populated by the driver post-negotiation and represent
+> the bit masks of what was actually accepted by the peer (useful for a GUI to display "device accepted
+> Stereo + 44.1 kHz out of the mask you offered").
 
 ### Device Address Format
 
@@ -337,20 +389,47 @@ BTHENUM\{0000110b-...}_VID&0001004c_PID&2027\9&3a3a251&0&340E224A88BB_C00000000
 
 ### Overview
 
-- **Crypto:** Ed25519 digital signatures (64 bytes / 512 bits)
-- **Verification:** Asymmetric — public key embedded in EXE, private key on server
-- **Storage:** Registry blobs at `HKLM:\Software\Luculent Systems\Alternative A2DP Driver\License`
-- **File format:** `.aalic` files (plain text key-value pairs + signature)
-- **Enforcement:** GUI-only. The kernel driver has NO license checks.
+- **Crypto:** ECDSA over a NIST curve (very likely **P-256 with SHA-256**), performed entirely through WinRT's `Windows.Security.Cryptography.Core.*` APIs. The 64-byte / 128-hex-char signature length is consistent with a P-256 `r||s` blob (32 + 32 bytes) — Ed25519 signatures happen to be the same length, but Ed25519 is **not** exposed by WinRT, and no `bcrypt.dll`, `ncrypt.dll`, or `crypt32.dll` is imported by `AltA2dpConfig.exe`, so a WinRT-only path effectively rules Ed25519 out.
+- **Verification:** Asymmetric — public key embedded in EXE, private key on Luculent's server.
+- **Storage:** Registry blobs under `HKLM:\Software\Luculent Systems\Alternative A2DP Driver\`.
+- **File format:** `.aalic` files (confirmed by the file-picker filter string `License files (*.aalic)`).
+- **Enforcement:** GUI-only. The kernel driver has NO license checks. `AltA2dpSVC.exe` also has zero crypto/network imports.
 
-### License Types
+### Evidence supporting the ECDSA (WinRT) call-out
+
+From an IAT + strings scan of `AltA2dpConfig.exe` v1.8.3.1:
+
+- **Imported WinRT type strings** include:
+  `Windows.Security.Cryptography.CryptographicBuffer`,
+  `Windows.Security.Cryptography.Core.AsymmetricKeyAlgorithmProvider`,
+  `Windows.Security.Cryptography.Core.AsymmetricAlgorithmNames`,
+  `Windows.Security.Cryptography.Core.EccCurveNames`,
+  `Windows.Security.Cryptography.Core.HashAlgorithmProvider`,
+  `Windows.Security.Cryptography.Core.HashAlgorithmNames`,
+  `Windows.Security.Cryptography.Core.CryptographicEngine`.
+- **No imported DLLs** for `bcrypt.dll`, `ncrypt.dll`, `crypt32.dll`, `wintrust.dll`, `secur32.dll`, `winhttp.dll`, or `wininet.dll` — everything crypto-related is dispatched through the WinRT COM factories via `RoGetActivationFactory`.
+- The explicit `EccCurveNames` reference makes ECC (ECDSA / ECDH) essentially certain, and the standard WinRT algorithm-name accessors that fit the observed 64-byte signature are `AsymmetricAlgorithmNames::EcdsaP256Sha256()` (returns a runtime `HSTRING`, not a literal — which is why no `"ECDSA_P256"` string appears verbatim in the binary).
+
+### License Types (unchanged since 1.8.0)
 
 | Type | Registry Value | Duration | Fingerprint |
 |------|---------------|----------|-------------|
 | Trial | `TrialLicense` | 7 days | BT adapter MAC hash + OS install ID hash (2 values) |
 | Paid | `PaidLicense` | Permanent | Full hardware fingerprint (motherboard, CPU, NICs, serial hashes, etc.) |
 
-### Trial License Format
+### `.aalic` file format (unverified against 1.8.3.1)
+
+> **Caveat added 2026-09-30:** The exact field names below were documented from an earlier
+> reverse. I ran a fresh literal-string search of `AltA2dpConfig.exe` v1.8.3.1 (both ASCII and
+> UTF-16LE, whole binary) and could **not** find literals like `licensed_software`,
+> `local_address_hash`, `signature:`, `system_uuid_hash`, `nic1`, `lpc_name`, `single_system`,
+> etc. Two plausible reasons: (a) the field names now live in `resources.pri` (compressed
+> XAML/asset store) or are constructed at runtime by concatenating shorter substrings, or (b)
+> the older writeup captured the format from an internal build. The shape below is still the
+> best current model, but treat the exact key names as **unverified for v1.8.3.1** — validate
+> against a real `.aalic` file before writing a parser.
+
+### Trial License Format (shape, not verified in 1.8.3.1)
 
 ```
 licensed_software:Alternative A2DP Driver (Trial)
@@ -359,10 +438,10 @@ local_address_hash:{32-bit hash of BT adapter MAC}
 os_id_hash:{32-bit hash of Windows installation ID}
 start:{unix timestamp}
 expire:{unix timestamp, start + 7 days}
-signature:{128 hex chars = 64 bytes Ed25519}
+signature:{128 hex chars = 64 bytes ECDSA r||s}
 ```
 
-### Paid License Format
+### Paid License Format (shape, not verified in 1.8.3.1)
 
 ```
 licensed_software:Alternative A2DP Driver with AAC CODEC Version 1.x
@@ -386,7 +465,7 @@ license_sku:{tier code, e.g., AC1d}
 license_type:single_system
 licensee:{email}
 licensed_date:{RFC 2822 date}
-signature:{128 hex chars Ed25519}
+signature:{128 hex chars ECDSA r||s}
 ```
 
 ### License Tiers
@@ -399,11 +478,13 @@ signature:{128 hex chars Ed25519}
 
 ### Hardware Fingerprint Sources
 
-The Config GUI uses these WinRT APIs:
+The Config GUI uses these WinRT APIs (all confirmed by class-name strings in the binary):
 - `Windows.System.Profile.HardwareIdentification`
 - `Windows.System.Profile.SystemIdentification`
-- `Windows.Security.Cryptography.Core.AsymmetricKeyAlgorithmProvider` (Ed25519 verify)
-- `Windows.Security.Cryptography.Core.HashAlgorithmProvider` (hashing)
+- `Windows.Security.Cryptography.Core.AsymmetricKeyAlgorithmProvider` (ECDSA verify)
+- `Windows.Security.Cryptography.Core.EccCurveNames` (NIST curve selector)
+- `Windows.Security.Cryptography.Core.HashAlgorithmProvider` (SHA-2 hashing)
+- `Windows.Security.Cryptography.Core.CryptographicEngine` (verify entrypoint)
 - WMI `root\wmi` (SMBIOS data)
 
 ### License Verification Flow
@@ -412,17 +493,19 @@ The Config GUI uses these WinRT APIs:
 Trial:
   1. User clicks "Fetch Trial License"
   2. App collects local_address_hash + os_id_hash
-  3. HTTP POST to Luculent backend (WinRT HttpClient)
+  3. HTTP POST to Luculent backend (via WinRT HttpClient - URL not
+     found as a plaintext literal in the binary, so it lives in
+     resources.pri or is constructed at runtime)
   4. Server checks if these hashes have trialed before
   5. If new: returns signed 7-day trial license
   6. If seen: returns error → "NoTrialLicense" / "NoMoreAacTrialMessage"
-  7. App verifies Ed25519 signature, stores in registry
+  7. App verifies ECDSA signature, stores in registry
 
 Purchase:
   1. User buys on product website
   2. Receives .aalic file
   3. In Config app: "Apply Purchased License" → FileOpenPicker (*.aalic)
-  4. App verifies Ed25519 signature
+  4. App verifies ECDSA signature
   5. App compares hardware fingerprint in license vs current machine
   6. Match → stored as PaidLicense, codec unlocked
   7. Mismatch → "LicenseFileMismatch" error
@@ -562,6 +645,13 @@ Set-ItemProperty $nextPath -Name "Codec" -Value 2
 Set-ItemProperty $nextPath -Name "AacChannelMode" -Value 4          # Stereo
 Set-ItemProperty $nextPath -Name "AacSamplingFrequency" -Value 8    # 44.1 kHz
 Set-ItemProperty $nextPath -Name "AacBitrate" -Value 256000         # 256 kbps
+
+# --- Optional v1.8.3.1 tuning knobs ---
+# Set-ItemProperty $nextPath -Name "AacAfterBurner"       -Value 1   # FDK-AAC "afterburner" (higher quality)
+# Set-ItemProperty $nextPath -Name "AacBitrateMode"       -Value 0   # 0 = CBR, other = VBR modes (device dependent)
+# Set-ItemProperty $nextPath -Name "AacBandwidth"         -Value 0   # 0 = encoder default
+# Set-ItemProperty $nextPath -Name "DisableAbsoluteVolume" -Value 0  # 1 = suppress AVRCP absolute-volume commands
+# Set-ItemProperty $nextPath -Name "VolumeInitializeDelay" -Value 500 # ms
 
 # Force reconnect to apply (requires admin)
 $instanceId = "BTHENUM\{0000110B-0000-1000-8000-00805F9B34FB}_VID&0001004C_PID&2027\9&3A3A251&0&340E224A88BB_C00000000"
