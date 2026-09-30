@@ -38,6 +38,8 @@ Re-verified end-to-end against the current build. **The bypass still works uncha
 
 **One correction to the previous writeup:** the license signature algorithm is almost certainly **ECDSA (WinRT-provided, most likely P-256)**, not Ed25519 — see §6 for the evidence.
 
+**One correction to the codec table (thanks @cyatarow, [issue #1](https://github.com/AbdullahFID/A2DP-Alternative-Driver-Bypass/issues/1)):** the `Codec` DWORD is a **6-bit bitmask**, not a small enum. Bit 0 = SBC (`1`), bit 1 = AAC (`2`), bit 2 = LDAC (`4`), bit 3 = aptX (`8`), bit 4 = aptX HD (`0x10`), bit 5 = aptX LL (`0x20`). Confirmed by disassembling the peer-capability parser inside `AltA2DP.sys` v1.8.3.1 — see §5 for the full evidence.
+
 ---
 
 ## Table of Contents
@@ -316,16 +318,36 @@ BTHENUM\{0000110b-...}_VID&0001004c_PID&2027\9&3a3a251&0&340E224A88BB_C00000000
 
 ## 5. Codec Parameter Reference
 
-### Codec Type Values
+### Codec Type Values — 6-bit bitmask
 
-| Value | Codec | Notes |
-|-------|-------|-------|
-| 0 | None | Not supported / not configured |
-| 1 | SBC | Mandatory baseline codec |
-| 2 | AAC | Advanced Audio Coding |
-| 3 | SBC + AAC | Device supports both (Capability only) |
+The `Codec` DWORD is the same 6-bit bitmask **in every subkey** (`Capability\`, `Current\`, `Next\`). The difference is:
 
-> **Note:** aptX/LDAC codec type values were not observed in active use (Apple devices don't support them). They are likely higher values (4, 5, 6, etc.) or encoded differently.
+- **`Capability\{addr}\Codec`** = the OR of every codec the peer device advertised (multiple bits set).
+- **`Current\{addr}\Codec`** = the single bit that was actually negotiated on the currently-open A2DP stream (one bit set, or `0` if disconnected).
+- **`Next\{addr}\Codec`** = the single bit you want the driver to pick on the next A2DP open (write one bit).
+
+Each bit corresponds to one codec:
+
+| Bit | Value (dec / hex) | Codec | Notes |
+|-----|------|-------|-------|
+| 0 | 1 / `0x01` | **SBC** | Mandatory A2DP baseline. Always in `Capability` for every device. |
+| 1 | 2 / `0x02` | **AAC** | MPEG-2/4 AAC. |
+| 2 | 4 / `0x04` | **LDAC** | Sony hi-res codec. |
+| 3 | 8 / `0x08` | **aptX** | Qualcomm aptX Classic. |
+| 4 | 16 / `0x10` | **aptX HD** | 24-bit variant. |
+| 5 | 32 / `0x20` | **aptX LL** | Low-latency variant. |
+
+The `Capability` value is the OR of all supported codec bits. Examples confirmed from live installs:
+
+| `Capability.Codec` value | Binary | Supported codecs |
+|---|---|---|
+| `0x03` (3) | `000011` | SBC + AAC (typical Apple AirPods) |
+| `0x2b` (43) | `101011` | SBC + AAC + aptX + aptX LL |
+| `0x3f` (63) | `111111` | Everything (SBC + AAC + LDAC + aptX + aptX HD + aptX LL) |
+
+To pick a codec, write a **single bit** into `Next\{addr}\Codec` (e.g. `2` for AAC, `4` for LDAC, `8` for aptX). Writing a value with multiple bits set to `Next\` is undefined behavior — pick one.
+
+> **Verification (2026-09-30):** The bit-position mapping was confirmed by disassembling the peer-capability-parser at VA `0x14006c70c` in `AltA2DP.sys` v1.8.3.1. That function contains one contiguous block of `or [rcx+4], imm` instructions writing exactly `1, 2, 4, 8, 0x10` into the codec field (and a separate handler emits `0x20` for aptX LL). The bit values (1, 2, 4, 8, 16, 32) also match the observed field-order in `.rdata` (SBC → AAC → LDAC → aptX → aptX HD → aptX LL) and independent user observations of `Codec=8` for aptX and `Codec=32` for aptX LL. Thanks to **@cyatarow** for the initial report ([issue #1](https://github.com/AbdullahFID/A2DP-Alternative-Driver-Bypass/issues/1)).
 
 ### SBC Parameters
 
@@ -614,7 +636,14 @@ Electron app
 
 ```powershell
 $base = "HKLM:\SYSTEM\CurrentControlSet\Services\AltA2DP\Parameters\Devices"
-$codecMap = @{0='None'; 1='SBC'; 2='AAC'; 3='SBC+AAC'}
+# Codec is a 6-bit bitmask: 1=SBC, 2=AAC, 4=LDAC, 8=aptX, 0x10=aptX HD, 0x20=aptX LL
+$codecBits = [ordered]@{ 1='SBC'; 2='AAC'; 4='LDAC'; 8='aptX'; 16='aptX HD'; 32='aptX LL' }
+function Format-Codec($v) {
+    if (-not $v) { return 'None' }
+    $on = @()
+    foreach ($k in $codecBits.Keys) { if ($v -band $k) { $on += $codecBits[$k] } }
+    if ($on.Count -eq 0) { 'None' } else { $on -join ', ' }
+}
 
 Get-ChildItem "$base\Capability" -EA SilentlyContinue | ForEach-Object {
     $addr = $_.PSChildName
@@ -625,11 +654,11 @@ Get-ChildItem "$base\Capability" -EA SilentlyContinue | ForEach-Object {
     [PSCustomObject]@{
         Device       = $cap.Name
         Address      = $addr
-        Supports     = $codecMap[[int]$cap.Codec]
-        CurrentCodec = if ($cur) { $codecMap[[int]$cur.Codec] } else { "N/A" }
+        Supports     = Format-Codec $cap.Codec
+        CurrentCodec = if ($cur) { Format-Codec $cur.Codec } else { "N/A" }
         Connected    = if ($cur) { $cur.Opened -eq 1 } else { $false }
         Bitrate      = if ($cur -and $cur.Bitrate -gt 0) { "$([math]::Round($cur.Bitrate/1000))kbps" } else { "-" }
-        NextCodec    = if ($nxt) { $codecMap[[int]$nxt.Codec] } else { "N/A" }
+        NextCodec    = if ($nxt) { Format-Codec $nxt.Codec } else { "N/A" }
     }
 } | Format-Table -AutoSize
 ```
@@ -667,7 +696,9 @@ Enable-PnpDevice -InstanceId $instanceId -Confirm:$false
 while ($true) {
     $cur = Get-ItemProperty "HKLM:\...\Devices\Current\0000340e224a88bb" -EA SilentlyContinue
     if ($cur) {
-        $codec = @{0='None';1='SBC';2='AAC'}[[int]$cur.Codec]
+        $codecBits = [ordered]@{ 1='SBC'; 2='AAC'; 4='LDAC'; 8='aptX'; 16='aptX HD'; 32='aptX LL' }
+        $codec = ($codecBits.Keys | Where-Object { $cur.Codec -band $_ } | ForEach-Object { $codecBits[$_] }) -join '+'
+        if (-not $codec) { $codec = 'None' }
         $status = if ($cur.Opened -eq 1) { "Connected" } else { "Disconnected" }
         Write-Host "[$([DateTime]::Now.ToString('HH:mm:ss'))] $status | $codec | $([math]::Round($cur.Bitrate/1000))kbps | Delay: $($cur.Delay * 0.1)ms"
     }
